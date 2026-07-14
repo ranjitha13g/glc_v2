@@ -129,8 +129,8 @@ class BatchChatRequest(BaseModel):
     """V8 batch endpoint. The gateway dispatches the inner calls with
     bounded parallelism so providers' rate limits are respected centrally."""
 
-    calls: list[ChatRequest]
-    max_concurrency: int = 4
+    calls: list[ChatRequest] = Field(..., max_length=10)
+    max_concurrency: int = Field(4, ge=1, le=8)
 
 
 class VisionRequest(BaseModel):

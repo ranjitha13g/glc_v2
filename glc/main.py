@@ -5,15 +5,17 @@ S11 surfaces (transcribe, speak, channels WS, control) sit alongside.
 
 from __future__ import annotations
 
+import collections
 import os
 import signal
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 ROOT = Path(__file__).parent
 load_dotenv(ROOT.parent / ".env")  # repo .env, if present
@@ -31,8 +33,19 @@ from glc.routes import control as control_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
+from glc.security import harden as _harden
+from glc.security.auth import require_token  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
+
+# ── C5: per-IP sliding-window rate limit for LLM data-plane routes ──────────
+_RATE_LIMIT_RPM = int(os.getenv("GLC_HTTP_RPM", "60"))
+_rate_windows: dict[str, collections.deque] = {}
+_rate_lock = threading.Lock()
+
+_RATE_LIMITED_PREFIXES = (
+    "/v1/chat", "/v1/vision", "/v1/embed", "/v1/speak", "/v1/transcribe",
+)
 
 
 def _install_sighup_reload() -> None:
@@ -70,16 +83,47 @@ async def lifespan(app: FastAPI):
     app.state.embedders, app.state.embed_order = E.build_embedders()
     app.state.started_at = time.time()
     app.state.registered_channels = []
+    _harden.seal(os.getpid())
     yield
 
 
-app = FastAPI(title="GLC v1 — Gateway for LLMs and Channels", lifespan=lifespan)
+# A2: disable OpenAPI explorer and schema in production; set GLC_DEBUG=1 to re-enable
+_debug = os.getenv("GLC_DEBUG") == "1"
+app = FastAPI(
+    title="GLC v1 — Gateway for LLMs and Channels",
+    lifespan=lifespan,
+    docs_url="/docs" if _debug else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if _debug else None,
+)
 
-app.include_router(chat_route.router)
-app.include_router(transcribe_route.router)
-app.include_router(speak_route.router)
-app.include_router(control_route.router)
-app.include_router(channels_route.router)
+
+# C5: HTTP rate-limit middleware (applied before auth so we fail fast)
+@app.middleware("http")
+async def _http_rate_limit(request: Request, call_next):
+    if any(request.url.path.startswith(p) for p in _RATE_LIMITED_PREFIXES):
+        client_ip = (request.client.host if request.client else "unknown")
+        now = time.time()
+        with _rate_lock:
+            window = _rate_windows.setdefault(client_ip, collections.deque())
+            while window and window[0] < now - 60:
+                window.popleft()
+            if len(window) >= _RATE_LIMIT_RPM:
+                return JSONResponse(
+                    {"detail": f"rate limit exceeded ({_RATE_LIMIT_RPM} req/min per IP)"},
+                    status_code=429,
+                )
+            window.append(now)
+    return await call_next(request)
+
+
+# A1: apply install-token auth to all data-plane routers
+_auth = [Depends(require_token)]
+app.include_router(chat_route.router, dependencies=_auth)
+app.include_router(transcribe_route.router, dependencies=_auth)
+app.include_router(speak_route.router, dependencies=_auth)
+app.include_router(control_route.router)    # already has its own _require_token
+app.include_router(channels_route.router)   # WS handler does its own auth inline
 
 
 @app.get("/", response_class=HTMLResponse)

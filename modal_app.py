@@ -26,18 +26,15 @@ LOCAL_GLC = Path(__file__).parent / "glc"
 # pyproject.toml, the glc package copied in, and GLC_CONFIG_DIR pointed at the
 # Volume mount so all databases land on persistent storage instead of the
 # throwaway container filesystem.
+# A5: pin to uv.lock so every deploy builds the exact same dependency set.
+# Rolling pip_install with >= ranges produced non-reproducible images.
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install(
-        "fastapi>=0.110",
-        "uvicorn[standard]>=0.27",
-        "httpx>=0.27",
-        "python-dotenv>=1.0",
-        "pydantic>=2.6",
-        "jsonschema>=4.21",
-        "pyyaml>=6.0",
-        "websockets>=12.0",
-        "twilio>=9.0",
+    .copy_local_file("pyproject.toml", remote_path="/root/pyproject.toml")
+    .copy_local_file("uv.lock", remote_path="/root/uv.lock")
+    .run_commands(
+        "pip install --quiet uv",
+        "cd /root && uv sync --frozen --no-dev",
     )
     .env({"GLC_CONFIG_DIR": "/data/glc"})
     .add_local_dir(str(LOCAL_GLC), remote_path="/root/glc")
@@ -56,7 +53,8 @@ llm_secret = modal.Secret.from_name("glc-llm-keys")
     image=image,
     volumes={"/data": data_volume},
     secrets=[llm_secret],
-    min_containers=0,  # scale to zero when idle -> protects the free tier
+    min_containers=0,   # scale to zero when idle -> protects the free tier
+    max_containers=1,   # A6: SQLite audit DB cannot handle concurrent writers
 )
 @modal.asgi_app()
 def fastapi_app():

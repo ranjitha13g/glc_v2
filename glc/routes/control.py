@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import signal
+import threading
 import time
 
 from fastapi import APIRouter, Header, HTTPException, Request
@@ -18,6 +19,27 @@ from glc.config import get_or_create_install_token
 from glc.security.pairing import CODE_TTL_SECONDS, get_pairing_store
 
 router = APIRouter()
+
+# C6: sliding-window lockout for pairing confirm — stops brute-force guessing
+_CONFIRM_MAX_FAILURES = 5
+_CONFIRM_WINDOW_S = 60
+_confirm_failures: list[float] = []
+_confirm_lock = threading.Lock()
+
+
+def _confirm_check_and_record(failed: bool) -> None:
+    now = time.time()
+    with _confirm_lock:
+        recent = [t for t in _confirm_failures if now - t < _CONFIRM_WINDOW_S]
+        if len(recent) >= _CONFIRM_MAX_FAILURES:
+            raise HTTPException(
+                429,
+                f"too many failed pairing attempts — wait {_CONFIRM_WINDOW_S}s",
+            )
+        if failed:
+            recent.append(now)
+        _confirm_failures.clear()
+        _confirm_failures.extend(recent)
 
 
 def _require_token(authorization: str | None) -> None:
@@ -63,8 +85,10 @@ async def pair(req: PairRequest, authorization: str | None = Header(default=None
 @router.post("/v1/control/pair/confirm")
 async def pair_confirm(req: PairConfirmRequest, authorization: str | None = Header(default=None)):
     _require_token(authorization)
+    _confirm_check_and_record(failed=False)   # raises 429 if already locked out
     rec = get_pairing_store().confirm_code(req.code)
     if rec is None:
+        _confirm_check_and_record(failed=True)  # record this failure
         raise HTTPException(404, "code unknown or expired")
     return {
         "channel": rec.channel,
