@@ -560,7 +560,8 @@ async def chat(req: ChatRequest, request: Request):
                     try:
                         parsed = _validate_structured(result["text"], req.response_format.schema_)
                     except (ValueError, ValidationError) as ve2:
-                        raise HTTPException(503, f"structured output failed validation: {ve2}")
+                        _log.warning("structured output failed schema validation: %s", ve2)
+                        raise HTTPException(503, "structured output did not match the requested schema")
 
             tokens = (result["input_tokens"] or 0) + (result["output_tokens"] or 0)
             rtr.state[name].tokens_today += tokens
