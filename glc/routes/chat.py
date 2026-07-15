@@ -357,12 +357,38 @@ async def _resolve_image_urls(messages):
     return out
 
 
+_SCHEMA_VALIDATE_TIMEOUT = 2.0
+_VALIDATOR_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="schema-validator"
+)
+
+
+def _check_schema_safe(schema: dict, _depth: int = 0) -> None:
+    """Reject schemas that could cause recursive $ref bombs or excessive nesting."""
+    if _depth > 12:
+        raise ValueError("schema nesting depth exceeds limit")
+    if isinstance(schema, dict):
+        ref = schema.get("$ref", "")
+        if ref == "#" or ref.endswith("/#") or ref.endswith("/$defs") or ref == "#/$defs":
+            raise ValueError(f"self-referential $ref '{ref}' is not allowed")
+        for v in schema.values():
+            _check_schema_safe(v, _depth + 1)
+    elif isinstance(schema, list):
+        for item in schema:
+            _check_schema_safe(item, _depth + 1)
+
+
 def _validate_structured(text: str, schema: dict):
     try:
         obj = json.loads(text)
     except Exception as e:
         raise ValueError(f"output is not JSON: {e}")
-    Draft202012Validator(schema).validate(obj)
+    _check_schema_safe(schema)
+    fut = _VALIDATOR_POOL.submit(Draft202012Validator(schema).validate, obj)
+    try:
+        fut.result(timeout=_SCHEMA_VALIDATE_TIMEOUT)
+    except concurrent.futures.TimeoutError:
+        raise ValueError("schema validation timed out — schema may be overly complex")
     return obj
 
 
@@ -569,6 +595,15 @@ async def chat(req: ChatRequest, request: Request):
             if router_decision is not None:
                 router_decision.chosen_worker_provider = name
                 router_decision.chosen_worker_model = result["model"]
+            # CF-5: scrub internal routing fields before sending to caller;
+            # router_provider/router_model reveal agent_routing.yaml internals.
+            public_router_decision = (
+                router_decision.model_copy(
+                    update={"router_provider": "(redacted)", "router_model": "(redacted)"}
+                )
+                if router_decision is not None
+                else None
+            )
             db.log_call(
                 provider=name,
                 model=result["model"],
@@ -606,7 +641,7 @@ async def chat(req: ChatRequest, request: Request):
                 reasoning_applied=result["reasoning_applied"],
                 parsed=parsed,
                 attempted=all_attempts,
-                router_decision=router_decision,
+                router_decision=public_router_decision,
                 retries=retries,
             ).model_dump()
         except P.ProviderError as e:
