@@ -11,6 +11,7 @@ regress them — tests in test_v9_compat.py assert behaviour shape.
 from __future__ import annotations
 
 import asyncio as _asyncio
+import concurrent.futures
 import json
 import logging
 import os
