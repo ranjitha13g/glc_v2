@@ -21,6 +21,8 @@ import os
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+_MAX_REGISTERED_CHANNELS = 1_000
+
 from glc.audit import append as audit_append
 from glc.channels import registry
 from glc.channels.envelope import ChannelMessage, ChannelReply
@@ -47,10 +49,19 @@ async def channel_ws(websocket: WebSocket, name: str):
 
     await websocket.accept()
     state = websocket.app.state
-    registered = list(getattr(state, "registered_channels", []))
-    if name not in registered:
+
+    # Track per-channel connection counts (ref-counted so cleanup is correct
+    # when multiple WS connections share the same channel name).
+    counts = dict(getattr(state, "_channel_conn_counts", {}))
+    if name not in counts:
+        registered = list(getattr(state, "registered_channels", []))
+        if len(registered) >= _MAX_REGISTERED_CHANNELS:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
         registered.append(name)
         state.registered_channels = registered
+    counts[name] = counts.get(name, 0) + 1
+    state._channel_conn_counts = counts
 
     limiter = get_rate_limiter()
     pairings = get_pairing_store()
@@ -128,7 +139,16 @@ async def channel_ws(websocket: WebSocket, name: str):
             )
             await websocket.send_text(reply.model_dump_json())
     except WebSocketDisconnect:
-        return
+        pass
+    finally:
+        counts = dict(getattr(state, "_channel_conn_counts", {}))
+        counts[name] = max(0, counts.get(name, 1) - 1)
+        state._channel_conn_counts = counts
+        if counts[name] == 0:
+            registered = list(getattr(state, "registered_channels", []))
+            if name in registered:
+                registered.remove(name)
+                state.registered_channels = registered
 
 
 @router.get("/v1/channels/{name}/webhook")
